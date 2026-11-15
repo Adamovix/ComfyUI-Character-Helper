@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-character-helper"
+description = "Tag prompt builder for characters: autocomplete a character to pre-fill their usual look (hair, eyes, outfit, ...), edit it as chips, or roll coherent random tags per field."
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.urls]
+Repository = "https://github.com/Adamovix/ComfyUI-Character-Helper"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "Character Helper"
+Icon = ""
