@@ -43,7 +43,16 @@ IDENTITY_FIELDS = ("subject", "hair", "eyes", "body")
 
 GARMENT_FIELDS = ("outfit", "top", "bottom")
 
-RATING_MODES = {"sfw": (0, 1), "any": (0, 1, 2, 3), "nsfw": (2, 3)}
+# Danbooru ratings, mildest first.  Picking one includes everything milder.
+RATINGS = ("general", "sensitive", "questionable", "explicit")
+DEFAULT_RATING = "sensitive"
+_LEGACY_RATINGS = {"sfw": "sensitive", "any": "explicit", "nsfw": "explicit"}
+
+
+def rating_level(rating):
+    """0..3 for general..explicit; unknown values fall back to the default."""
+    rating = _LEGACY_RATINGS.get(rating, rating)
+    return RATINGS.index(rating if rating in RATINGS else DEFAULT_RATING)
 
 # The dice only use tags with at least this many posts: rarer ones are mostly
 # unknown to image models.  (Autocomplete still offers everything.)
@@ -238,7 +247,7 @@ class TagDB:
                      field=self.field_ids[self.tags[i][1]], alias=alias)
                 for _o, _r, _n, i, alias in found[:limit]]
 
-    def suggest(self, field, context, limit=14, rating="sfw"):
+    def suggest(self, field, context, limit=14, rating=DEFAULT_RATING):
         """Suggestions for an empty input: what goes well with the other fields."""
         self.load()
         context = context or {}
@@ -378,7 +387,7 @@ class TagDB:
         scores = np.zeros(self.p_n, dtype=np.float32)
         for t in ctx_ids:
             scores[self.inv_posts[self.inv_ptr[t]:self.inv_ptr[t + 1]]] += self.idf[t]
-        mask = np.isin(self.p_rating, RATING_MODES.get(rating, RATING_MODES["sfw"]))
+        mask = self.p_rating <= rating_level(rating)
         if field is not None:
             have = self.p_field_count[self.field_index[field]]
             # posts that can fill the field on their own keep the pick coherent
@@ -414,7 +423,8 @@ class TagDB:
         t = self.tags[tid]
         if t[2] < RANDOM_MIN_COUNT:          # too rare for image models to know
             return False
-        return rating != "sfw" or t[3] < 0.5
+        # below "questionable", skip tags that mostly appear on questionable/explicit pictures
+        return rating_level(rating) >= 2 or t[3] < 0.5
 
     def _conflicts(self, tid, picked):
         """Would adding ``tid`` contradict or merely repeat what is picked?"""
@@ -452,7 +462,7 @@ class TagDB:
             ids = sorted(ids, key=lambda t: -self.tags[t][2])
         return [self.tags[t][0] for t in ids]
 
-    def random_field(self, field, count, context, rating="sfw", rng=None):
+    def random_field(self, field, count, context, rating=DEFAULT_RATING, rng=None):
         """``count`` tags for one field that fit the rest of the prompt."""
         rng = rng or random
         count = max(0, int(count))
@@ -479,7 +489,7 @@ class TagDB:
         c = rng.choices(self.characters, weights=self._char_weights, k=1)[0]
         return [c[0]] + ([c[2]] if c[2] else [])
 
-    def randomize(self, fields, counts, context, rating="sfw", seed=None):
+    def randomize(self, fields, counts, context, rating=DEFAULT_RATING, seed=None):
         """Fill several fields at once.  ``context`` holds the fields to keep.
 
         All fields are taken from one real picture where possible, so that the

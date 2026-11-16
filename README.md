@@ -1,21 +1,24 @@
 # ComfyUI-Character-Helper
 
 A ComfyUI node that builds a coherent Danbooru-style tag prompt for a character.
-Type a character name and the node fills in their usual look – hair, eyes, outfit,
+Pick a character and the node can fill in their usual look – hair, eyes, outfit,
 accessories – as editable tags. Swap what you want, or roll the dice.
 
 ![Character Helper node](docs/screenshot.png)
 
 ## What it does
 
-- **Character autocomplete** – type `hatsune`, pick `hatsune_miku`, and every field is
-  filled with the tags most often seen on that character (39,000 characters).
+- **Character autocomplete** – type `hatsune` and pick `hatsune_miku`
+  (39,000 characters). Like every other field, this changes only the character.
+- **Usual look** – fills the other fields with the tags most often seen on that
+  character.
 - **Edit as chips** – click `×` to remove a tag, click a tag to edit it, type to add
   one. Every field has its own autocomplete (17,000 tags), sorted by popularity.
 - **Suggestions** – click into an empty field to see what goes well with the rest of
   the prompt (for a character: their other common tags, with percentages).
 - **Dice per field** – rolls tags for that one field that fit everything else.
-  The number next to it is how many tags you get.
+  The number next to it is how many tags you get. The character dice rolls a
+  character and leaves the rest alone, so you can try several on the same look.
 - **Randomize** – rolls every unlocked field at once. The look is taken from one real
   picture, so outfit, pose and scene belong together.
 - **Locks** – a locked field is left alone by *Randomize*, *Usual look* and *Clear*.
@@ -61,22 +64,11 @@ to any text input.
 | view | framing and camera angle | `cowboy_shot` |
 | background | setting, lighting, props | `simple_background`, `white_background` |
 
-## Keys
-
-| Key | Does |
-|---|---|
-| `Enter` / `Tab` | take the highlighted suggestion |
-| `↑` `↓` | move through suggestions |
-| `,` | add exactly what you typed (also for tags the database doesn't know, or `(tag:1.2)`) |
-| `Backspace` in an empty input | remove the last tag |
-| `Esc` | close the suggestions |
-
-Pasting `a, b, c` adds three tags.
-
 ## Options
 
-- **SFW / Any / NSFW** – which pictures the dice and suggestions draw from
-  (Danbooru ratings general + sensitive / all / questionable + explicit).
+- **General / Sensitive / Questionable / Explicit** – the highest Danbooru rating the
+  dice and suggestions draw from. Milder ratings are always included, so
+  *Questionable* also uses General and Sensitive pictures. Default: Sensitive.
 - **underscores_to_spaces** – `aqua_hair` → `aqua hair` (what Illustrious, NoobAI and
   Anima expect). Emoticons such as `^_^` are left alone.
 - **escape_parentheses** – `ganyu_(genshin_impact)` → `ganyu \(genshin impact\)`, so
@@ -85,10 +77,11 @@ Pasting `a, b, c` adds three tags.
 ## How the suggestions are made
 
 - **Character looks** come from 11.7 million Danbooru posts. For each character only
-  solo, SFW pictures without `alternate_costume` and similar tags are counted, so the
-  result is their usual look. A tag makes it into the preset when it appears on enough
-  of those pictures; of hair colours, eye colours and hair lengths only the most common
-  one is kept, and `white_shirt` replaces the plain `shirt`.
+  solo pictures rated General or Sensitive, without `alternate_costume` and similar
+  tags, are counted, so the result is their usual look. A tag makes it into the preset
+  when it appears on enough of those pictures; of hair colours, eye colours and hair
+  lengths only the most common one is kept, and `white_shirt` replaces the plain
+  `shirt`.
 - **Dice** draw from a pool of 160,000 well-tagged solo pictures. The node looks for
   pictures that share the most (and the most telling) tags with your other fields and
   takes the field's tags from one of them. Only tags with at least 1,000 posts are

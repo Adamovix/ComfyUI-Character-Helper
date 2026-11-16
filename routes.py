@@ -42,7 +42,7 @@ async def autocomplete(request):
 async def suggest(request):
     body = await request.json()
     result = await _run(DB.suggest, body.get("field", ""), body.get("context") or {},
-                        _limit(body.get("limit"), 14), body.get("rating", "sfw"))
+                        _limit(body.get("limit"), 14), body.get("rating"))
     return web.json_response(result)
 
 
@@ -60,5 +60,5 @@ async def randomize(request):
     fields = [f for f in body.get("fields") or [] if isinstance(f, str)]
     counts = {k: v for k, v in (body.get("counts") or {}).items() if isinstance(v, (int, float))}
     result = await _run(DB.randomize, fields, counts, body.get("context") or {},
-                        body.get("rating", "sfw"), body.get("seed"))
+                        body.get("rating"), body.get("seed"))
     return web.json_response(dict(fields=result))

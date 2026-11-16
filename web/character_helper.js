@@ -21,7 +21,10 @@ const FIELDS = [
 const FIELD_LABEL = Object.fromEntries(FIELDS.map(([id, label]) => [id, label]));
 // rows that get a little extra space above them, to group the list visually
 const GROUP_START = new Set(["hair", "outfit", "expression"]);
-const RATINGS = [["sfw", "SFW"], ["any", "Any"], ["nsfw", "NSFW"]];
+// Danbooru ratings, mildest first. The chosen one includes everything milder.
+const RATINGS = [["general", "General"], ["sensitive", "Sensitive"], ["questionable", "Questionable"], ["explicit", "Explicit"]];
+const DEFAULT_RATING = "sensitive";
+const LEGACY_RATINGS = { sfw: "sensitive", any: "explicit", nsfw: "explicit" };
 
 const ICON = {
     dice: '<svg viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="5.5" cy="5.5" r="1.1"/><circle cx="10.5" cy="10.5" r="1.1"/><circle cx="8" cy="8" r="1.1"/></svg>',
@@ -139,7 +142,7 @@ class Row {
         this.count.type = "number"; this.count.min = 0; this.count.max = 9; this.count.value = count;
         this.count.title = "How many tags the dice adds" + (id === "character" ? " (0 = no named character)" : "");
         this.dice = el("button", "chh-btn", ICON.dice);
-        this.dice.title = id === "character" ? "Random character (fills in their usual look)" : `Random ${label} that fits the other fields`;
+        this.dice.title = id === "character" ? "Random character (only changes this field – “Usual look” fills in the rest)" : `Random ${label} that fits the other fields`;
         this.lock = el("button", "chh-btn chh-lock", ICON.unlock);
         this.lock.title = "Lock: keep this field when randomizing, filling or clearing everything";
         this.el.append(lab, this.box, this.count, this.dice, this.lock);
@@ -236,7 +239,7 @@ class Row {
             this.panel.state.locks.character = true;   // a hand-picked character survives "Randomize"
             this.panel.changed();
             dropdown.hide();
-            this.panel.applyCharacter(item.tag, false);
+            this.panel.say("“Usual look” fills in their tags.");
             return;
         }
         this.add([item.tag]);
@@ -324,7 +327,7 @@ class Panel {
         button("", ICON.person + "<span>Usual look</span>", "Fill the unlocked fields with the character's most common tags", () => this.applyCharacter(null, true));
         bar.appendChild(el("span", "chh-spacer"));
         this.rating = el("select", "chh-rating");
-        this.rating.title = "Which pictures the dice and suggestions draw from";
+        this.rating.title = "Highest Danbooru rating the dice and suggestions draw from (milder ratings are included)";
         for (const [value, label] of RATINGS) this.rating.appendChild(new Option(label, value));
         this.rating.addEventListener("change", () => { this.state.rating = this.rating.value; this.changed(false); });
         bar.appendChild(this.rating);
@@ -353,7 +356,7 @@ class Panel {
             fields: Object.fromEntries(FIELDS.map(([id]) => [id, []])),
             locks: {},
             counts: Object.fromEntries(FIELDS.map(([id, , n]) => [id, n])),
-            rating: "sfw",
+            rating: DEFAULT_RATING,
         };
     }
 
@@ -373,7 +376,8 @@ class Panel {
                 if (data.locks?.[id]) s.locks[id] = true;
                 if (Number.isFinite(data.counts?.[id])) s.counts[id] = data.counts[id];
             }
-            if (RATINGS.some(([r]) => r === data.rating)) s.rating = data.rating;
+            const rating = LEGACY_RATINGS[data.rating] || data.rating;
+            if (RATINGS.some(([r]) => r === rating)) s.rating = rating;
         }
         this.state = s;
         this.undoStack = [];
@@ -478,7 +482,7 @@ class Panel {
             this.snapshot();
             Object.assign(this.state.fields, res.fields);
             this.changed();
-            if (single === "character" && res.fields.character?.length) await this.applyCharacter(res.fields.character[0], false);
+            if (single === "character" && res.fields.character?.length) this.say("“Usual look” fills in their tags.");
             else if (single && !res.fields[single]?.length) this.say("Nothing found for this field.", true);
         });
     }

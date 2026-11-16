@@ -7,7 +7,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nodes import format_tag, join_fields, parse_fields  # noqa: E402
-from tagdb import DB, normalize  # noqa: E402
+from tagdb import DB, normalize, rating_level  # noqa: E402
 
 DB.load()
 
@@ -57,23 +57,32 @@ def test_character_preset():
 
 def test_random():
     ctx = {"character": ["hatsune_miku", "vocaloid"]}
-    a = DB.randomize([f for f in DB.field_ids if f != "character"], {}, ctx, "sfw", seed=7)
-    b = DB.randomize([f for f in DB.field_ids if f != "character"], {}, ctx, "sfw", seed=7)
+    a = DB.randomize([f for f in DB.field_ids if f != "character"], {}, ctx, "sensitive", seed=7)
+    b = DB.randomize([f for f in DB.field_ids if f != "character"], {}, ctx, "sensitive", seed=7)
     assert a == b                                           # same seed, same result
     assert "aqua_hair" in a["hair"]                         # identity comes from the character
     assert "character" not in a
 
-    hair = DB.random_field("hair", 3, {}, "sfw", random.Random(1))
+    hair = DB.random_field("hair", 3, {}, "sensitive", random.Random(1))
     assert 1 <= len(hair) <= 3
     colours = set(DB.groups["hair_color"]["tags"])
     multi = DB.groups["hair_color"]["multi"]
     ids = DB.ids(hair)
     assert sum(i in colours for i in ids) <= 1 or any(i in multi for i in ids)
 
-    full = DB.randomize(DB.field_ids, {"character": 0}, {}, "sfw", seed=3)
+    full = DB.randomize(DB.field_ids, {"character": 0}, {}, "sensitive", seed=3)
     assert full["character"] == [] and full["subject"]
 
 
 def test_suggest():
     tags = [s["tag"] for s in DB.suggest("pose", {"outfit": ["swimsuit"], "background": ["beach"]})]
     assert tags and len(tags) == len(set(tags))
+
+
+def test_ratings_are_cumulative():
+    assert [rating_level(r) for r in ("general", "sensitive", "questionable", "explicit")] == [0, 1, 2, 3]
+    assert rating_level("sfw") == 1 and rating_level("nsfw") == 3     # values saved by older versions
+    assert rating_level(None) == rating_level("nonsense") == 1
+    sizes = [int(DB._score_posts([], None, r)[1].sum()) for r in ("general", "sensitive", "questionable", "explicit")]
+    assert sizes == sorted(sizes) and len(set(sizes)) == 4          # each rating adds pictures
+    assert sizes[-1] == DB.p_n                                       # explicit = everything
