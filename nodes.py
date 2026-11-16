@@ -5,9 +5,6 @@ from __future__ import annotations
 import json
 import re
 
-FIELD_ORDER = ["subject", "character", "hair", "eyes", "body", "outfit", "top", "bottom",
-               "legwear", "accessories", "expression", "pose", "view", "background"]
-
 _WEIGHTED = re.compile(r"^\((.+):(\s*-?\d*\.?\d+)\)$")
 # Emoticon tags keep their underscore (^_^, >_<, o_o, ...).
 _KEEP_UNDERSCORE = re.compile(r"^.{1,4}$|^[^a-z0-9]+_[^a-z0-9]+$")
@@ -26,30 +23,19 @@ def format_tag(tag, spaces=True, escape=True):
 
 
 def parse_fields(value):
-    """The widget value is JSON: {"fields": {"hair": ["aqua_hair", ...], ...}, ...}"""
-    if isinstance(value, dict):
-        data = value
-    else:
-        try:
-            data = json.loads(value) if value else {}
-        except (TypeError, ValueError):
-            # not JSON: treat it as a plain comma separated prompt
-            return {"extra": [t for t in str(value).split(",") if t.strip()]}
-    fields = data.get("fields", data) if isinstance(data, dict) else {}
-    out = {}
-    for name, tags in fields.items():
-        if isinstance(tags, str):
-            tags = tags.split(",")
-        if isinstance(tags, (list, tuple)):
-            out[name] = [str(t).strip() for t in tags if str(t).strip()]
-    return out
+    """The widget's value, ``{"fields": {"hair": ["aqua_hair", ...], ...}, ...}`` as JSON, -> its fields."""
+    if not value:
+        return {}
+    data = json.loads(value) if isinstance(value, str) else value
+    return {name: [t.strip() for t in tags if t.strip()] for name, tags in data.get("fields", {}).items()}
 
 
 def join_fields(fields, spaces=True, escape=True):
-    order = FIELD_ORDER + [f for f in fields if f not in FIELD_ORDER]
+    # "1girl, solo" leads; the other fields follow in the order the node shows them
+    order = sorted(fields, key=lambda name: name != "subject")
     seen, out = set(), []
     for name in order:
-        for tag in fields.get(name, ()):
+        for tag in fields[name]:
             key = tag.lower().replace(" ", "_")
             if key not in seen:
                 seen.add(key)
@@ -80,7 +66,7 @@ class CharacterHelper:
     FUNCTION = "build"
     CATEGORY = "utils/prompt"
     DESCRIPTION = ("Builds a comma separated tag prompt from fields (character, hair, eyes, clothes, "
-                   "pose, ...). Pick a character to pre-fill its usual look, or roll the dice.")
+                   "pose, ...). Pick a character and fill in their usual look, or roll the dice.")
     SEARCH_ALIASES = ["character", "danbooru", "tags", "prompt builder", "random prompt"]
 
     def build(self, fields, underscores_to_spaces=True, escape_parentheses=True):

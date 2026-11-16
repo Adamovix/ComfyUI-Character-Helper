@@ -6,6 +6,8 @@ accessories – as editable tags. Swap what you want, or roll the dice.
 
 ![Character Helper node](docs/screenshot.png)
 
+[Example workflow](example_workflows/character_helper.json)
+
 ## What it does
 
 - **Character autocomplete** – type `hatsune` and pick `hatsune_miku`

@@ -13,14 +13,15 @@ import os
 import random
 import re
 import threading
+from typing import NamedTuple
 
 import numpy as np
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-# Fields a character preset is allowed to fill, and how picky it is:
-# field -> (minimum % of the character's pictures, minimum share of the field's
-# most common tag, maximum number of tags)
+# How picky a character preset is, per field:
+# (minimum % of the character's pictures, minimum share of the field's most
+# common tag, maximum number of tags)
 PRESET_RULES = {
     "subject": (30, 0.0, 2),
     "hair": (28, 0.0, 5),
@@ -36,9 +37,11 @@ PRESET_RULES = {
     "view": (15, 0.0, 1),
     "background": (15, 0.0, 2),
 }
+# Every character has hair and eyes: if nothing clears the bar above, lower it.
+PRESET_FALLBACK_PERCENT = {"hair": 8, "eyes": 8}
 
-# Fields that describe who the character is.  "Randomize all" takes these from
-# the character when one is set instead of rolling them.
+# Fields that say who the character is.  "Randomize" takes these from the
+# character, when one is set, instead of rolling them.
 IDENTITY_FIELDS = ("subject", "hair", "eyes", "body")
 
 GARMENT_FIELDS = ("outfit", "top", "bottom")
@@ -46,19 +49,32 @@ GARMENT_FIELDS = ("outfit", "top", "bottom")
 # Danbooru ratings, mildest first.  Picking one includes everything milder.
 RATINGS = ("general", "sensitive", "questionable", "explicit")
 DEFAULT_RATING = "sensitive"
-_LEGACY_RATINGS = {"sfw": "sensitive", "any": "explicit", "nsfw": "explicit"}
-
-
-def rating_level(rating):
-    """0..3 for general..explicit; unknown values fall back to the default."""
-    rating = _LEGACY_RATINGS.get(rating, rating)
-    return RATINGS.index(rating if rating in RATINGS else DEFAULT_RATING)
 
 # The dice only use tags with at least this many posts: rarer ones are mostly
 # unknown to image models.  (Autocomplete still offers everything.)
 RANDOM_MIN_COUNT = 1000
 
 _WEIGHT = re.compile(r"^\((.+):\s*-?\d*\.?\d+\)$")
+
+
+class Tag(NamedTuple):
+    name: str
+    field: int      # index into TagDB.field_ids
+    count: int      # posts on Danbooru
+    nsfw: float     # share of those posts rated questionable or explicit
+
+
+class Character(NamedTuple):
+    name: str
+    count: int
+    series: str     # "" when unknown
+    aliases: list
+    clean: int      # 1 when the statistics come from solo pictures of the usual look
+
+
+def rating_level(rating):
+    """0..3 for general..explicit; anything else counts as the default."""
+    return RATINGS.index(rating if rating in RATINGS else DEFAULT_RATING)
 
 
 def normalize(tag):
@@ -72,7 +88,7 @@ def normalize(tag):
 
 
 def _match_rank(name, q, tokens):
-    """0 = the name or one of its words starts with the query, 2 = contains it.
+    """0 = the name or one of its words starts with the query, 1 = contains it, -1 = no match.
 
     "miku" should find hatsune_miku before the far rarer mikuma_(kancolle), so
     a match at the start of any word counts the same as one at the very start.
@@ -81,10 +97,20 @@ def _match_rank(name, q, tokens):
     if i == 0 or (i > 0 and name[i - 1] in "_(-/:"):
         return 0
     if i > 0:
-        return 2
+        return 1
     if len(tokens) > 1 and all(t in name for t in tokens):
-        return 2
+        return 1
     return -1
+
+
+def _match(name, aliases, q, tokens):
+    """(rank, alias that matched or None); rank -1 when nothing matches."""
+    rank = _match_rank(name, q, tokens)
+    if rank < 0:
+        for alias in aliases:
+            if alias.startswith(q):
+                return 0, alias
+    return rank, None
 
 
 class TagDB:
@@ -93,49 +119,52 @@ class TagDB:
         self._lock = threading.Lock()
         self._loaded = False
         self._pool_ready = False
+        self._char_weights = None
 
     # ------------------------------------------------------------------ load
-    def _read(self, name):
+    def _read_json(self, name):
         with gzip.open(os.path.join(self.data_dir, name), "rt", encoding="utf8") as f:
             return json.load(f)
 
     def load(self):
+        """Tags and characters (about a second; the picture pool loads on first use)."""
         if self._loaded:
             return self
         with self._lock:
             if self._loaded:
                 return self
-            meta = self._read("tags.json.gz")
-            self.fields = meta["fields"]
+            meta = self._read_json("tags.json.gz")
+            self.fields = meta["fields"]                  # [{id, label, count, group}]
             self.field_ids = [f["id"] for f in self.fields]
             self.field_index = {f: i for i, f in enumerate(self.field_ids)}
-            self.tags = meta["tags"]                      # [name, field index, count, nsfw share]
-            self.tag_id = {t[0]: i for i, t in enumerate(self.tags)}
-            self.tag_field = np.array([t[1] for t in self.tags], dtype=np.int16)
-            self.implies = {int(k): set(v) for k, v in meta["implies"].items()}
-            self.aliases = {int(k): v for k, v in meta["aliases"].items()}
-            self.series = meta["series"]                  # [name, count]
-            self.series_set = {s[0] for s in self.series}
-            self.soft = set(meta.get("soft", ()))        # too generic for a character preset
-            self.colors = tuple(c + "_" for c in meta.get("colors", ()))
-            self.groups = meta["groups"]
-            self.group_of = {}
-            for gname, g in self.groups.items():
-                g["multi"] = set(g["multi"])
-                for t in g["tags"]:
-                    self.group_of[t] = gname
+            self.default_count = {f["id"]: f["count"] for f in self.fields}
+
+            self.tags = [Tag(*t) for t in meta["tags"]]   # most common first
+            self.tag_id = {t.name: i for i, t in enumerate(self.tags)}
+            self.tag_field = np.array([t.field for t in self.tags], dtype=np.int16)
             self.by_field = {f: [] for f in self.field_ids}
-            for i, t in enumerate(self.tags):             # tags are sorted by count already
-                self.by_field[self.field_ids[t[1]]].append(i)
-            self.characters = self._read("characters.json.gz")  # [name, count, series, aliases, clean]
+            for i, t in enumerate(self.tags):
+                self.by_field[self.field_ids[t.field]].append(i)
+            self.aliases = {int(k): v for k, v in meta["aliases"].items()}
+            # tag -> the more general tags it implies (white_shirt -> shirt)
+            self.implies = {int(k): set(v) for k, v in meta["implies"].items()}
+            self.soft = set(meta["soft"])                 # never part of a character preset
+            self.colors = tuple(c + "_" for c in meta["colors"])
+            # exclusive groups: one hair colour, one hair length, ...
+            self.groups = {name: dict(tags=g["tags"], multi=set(g["multi"])) for name, g in meta["groups"].items()}
+            self.group_of = {t: name for name, g in self.groups.items() for t in g["tags"]}
+            self.series = meta["series"]                  # [name, count], most common first
+
+            self.characters = [Character(*c) for c in self._read_json("characters.json.gz")]
+            self.char_id = {c.name: i for i, c in enumerate(self.characters)}
+            # per character: (tag, % of their pictures) pairs, most common first
             z = np.load(os.path.join(self.data_dir, "character_tags.npz"))
             self.c_indptr, self.c_tags, self.c_pct = z["indptr"], z["tags"], z["percent"]
-            self.char_id = {c[0]: i for i, c in enumerate(self.characters)}
-            self.built = meta.get("built", "")
             self._loaded = True
         return self
 
     def _load_pool(self):
+        """The pool of real pictures the dice draw from, plus a tag -> pictures index."""
         self.load()
         if self._pool_ready:
             return
@@ -145,50 +174,41 @@ class TagDB:
             z = np.load(os.path.join(self.data_dir, "posts.npz"))
             indptr = z["indptr"].astype(np.int64)
             tags = z["tags"].astype(np.int32)
-            self.p_indptr, self.p_tags, self.p_rating = indptr, tags, z["rating"]
-            n = len(indptr) - 1
-            self.p_n = n
+            self.p_indptr, self.p_tags = indptr, tags     # picture p has tags[indptr[p]:indptr[p + 1]]
+            self.p_rating = z["rating"]                   # 0..3, see RATINGS
+            n = self.p_n = len(indptr) - 1
             post_of = np.repeat(np.arange(n, dtype=np.int32), np.diff(indptr))
             order = np.argsort(tags, kind="stable")
-            self.inv_posts = post_of[order]               # posts grouped by tag
+            self.inv_posts = post_of[order]               # pictures grouped by tag
             self.inv_ptr = np.searchsorted(tags[order], np.arange(len(self.tags) + 1))
             df = np.diff(self.inv_ptr).astype(np.float64)
-            self.idf = np.log((n + 1.0) / (df + 1.0)).astype(np.float32)
-            # how many tags of each field a post has
+            self.idf = np.log((n + 1.0) / (df + 1.0)).astype(np.float32)   # rare tags tell more
+            # how many tags of each field a picture has
             self.p_field_count = np.zeros((len(self.field_ids), n), dtype=np.uint8)
             np.add.at(self.p_field_count, (self.tag_field[tags], post_of), 1)
             self._pool_ready = True
 
     # -------------------------------------------------------------- helpers
     def ids(self, tags):
-        out = []
-        for t in tags or ():
-            i = self.tag_id.get(normalize(t))
-            if i is not None:
-                out.append(i)
-        return out
+        """Ids of the tags the database knows; the rest is skipped."""
+        found = (self.tag_id.get(normalize(t)) for t in tags or ())
+        return [i for i in found if i is not None]
 
     def _context_ids(self, context, skip=()):
         out = []
         for field, tags in (context or {}).items():
-            if field in skip:
-                continue
-            out.extend(self.ids(tags))
+            if field not in skip:
+                out.extend(self.ids(tags))
         return list(dict.fromkeys(out))
 
     def find_character(self, tags):
-        """First known character among the given tags, as an index (or None)."""
+        """Index of the first known character among the given tags, or None."""
         self.load()
         for t in tags or ():
             i = self.char_id.get(normalize(t))
             if i is not None:
                 return i
         return None
-
-    def _is_person(self, ci):
-        """Mostly drawn as 1girl / 1boy (not a creature, vehicle or object)."""
-        people = set(self.groups["subject"]["tags"])
-        return any(t in people and p >= 60 for t, p in self._char_pairs(ci))
 
     def _char_pairs(self, ci):
         """[(tag id, percent of the character's pictures)], most common first."""
@@ -199,117 +219,123 @@ class TagDB:
         """field id -> [(tag id, percent)] for a character, most common first."""
         out = {}
         for tid, pct in self._char_pairs(ci):
-            out.setdefault(self.field_ids[self.tags[tid][1]], []).append((tid, pct))
+            out.setdefault(self.field_ids[self.tags[tid].field], []).append((tid, pct))
         return out
+
+    def _is_person(self, ci):
+        """Mostly drawn as 1girl / 1boy (not a creature, vehicle or object)."""
+        people = set(self.groups["subject"]["tags"])
+        return any(t in people and p >= 60 for t, p in self._char_pairs(ci))
+
+    @staticmethod
+    def _character_tags(c):
+        return [c.name, c.series] if c.series else [c.name]
+
+    def _subject_order(self, tid):
+        """Sort key for the subject field: 1girl, solo, then anything more specific."""
+        if self.group_of.get(tid) == "subject":
+            return 0
+        return 1 if self.tags[tid].name == "solo" else 2
+
+    def _dedupe(self, tags):
+        """Drop tags that another one already implies (shirt, next to white_shirt)."""
+        implied = set()
+        for t in tags:
+            implied |= self.implies.get(t, set())
+        return [t for t in tags if t not in implied]
 
     # --------------------------------------------------------- autocomplete
     def autocomplete(self, field, query, limit=12):
+        """Tags matching what was typed: the edited field's own tags first, then by popularity."""
         self.load()
         q = normalize(query)
         if not q:
             return []
         tokens = [t for t in q.split("_") if t]
-        found = []
         if field == "character":
-            for i, c in enumerate(self.characters):
-                r = _match_rank(c[0], q, tokens)
-                alias = None
-                if r < 0:
-                    for a in c[3]:
-                        if a.startswith(q):
-                            r, alias = 0, a
-                            break
-                if r >= 0:
-                    found.append((r, -c[1], i, alias))
-            found.sort()
-            out = [dict(tag=self.characters[i][0], count=self.characters[i][1], kind="character",
-                        series=self.characters[i][2], alias=alias) for _r, _n, i, alias in found[:limit]]
-            if len(out) < limit:
-                extra = [(r, -n, s) for s, n in self.series for r in [_match_rank(s, q, tokens)] if r >= 0]
-                extra.sort()
-                out += [dict(tag=s, count=-n, kind="series") for _r, n, s in extra[:limit - len(out)]]
-            return out
+            return self._autocomplete_character(q, tokens, limit)
 
         fi = self.field_index.get(field, -1)
+        found = []
         for i, t in enumerate(self.tags):
-            r = _match_rank(t[0], q, tokens)
-            alias = None
-            if r < 0:
-                for a in self.aliases.get(i, ()):
-                    if a.startswith(q):
-                        r, alias = 0, a
-                        break
-            if r >= 0:
-                # tags of the field being edited come first, then everything else
-                found.append((0 if t[1] == fi else 1, r, -t[2], i, alias))
+            rank, alias = _match(t.name, self.aliases.get(i, ()), q, tokens)
+            if rank >= 0:
+                found.append((t.field != fi, rank, -t.count, i, alias))
         found.sort()
-        return [dict(tag=self.tags[i][0], count=self.tags[i][2], kind="tag",
-                     field=self.field_ids[self.tags[i][1]], alias=alias)
-                for _o, _r, _n, i, alias in found[:limit]]
+        return [dict(tag=self.tags[i].name, count=self.tags[i].count, kind="tag",
+                     field=self.field_ids[self.tags[i].field], alias=alias)
+                for *_, i, alias in found[:limit]]
+
+    def _autocomplete_character(self, q, tokens, limit):
+        found = []
+        for i, c in enumerate(self.characters):
+            rank, alias = _match(c.name, c.aliases, q, tokens)
+            if rank >= 0:
+                found.append((rank, -c.count, i, alias))
+        found.sort()
+        out = [dict(tag=self.characters[i].name, count=self.characters[i].count, kind="character",
+                    series=self.characters[i].series, alias=alias) for *_, i, alias in found[:limit]]
+        if len(out) < limit:    # room left: a series tag is welcome in the character field too
+            series = [(rank, -n, s) for s, n in self.series for rank in [_match_rank(s, q, tokens)] if rank >= 0]
+            series.sort()
+            out += [dict(tag=s, count=-n, kind="series") for _rank, n, s in series[:limit - len(out)]]
+        return out
 
     def suggest(self, field, context, limit=14, rating=DEFAULT_RATING):
         """Suggestions for an empty input: what goes well with the other fields."""
         self.load()
         context = context or {}
-        have = set(self.ids(context.get(field)))
-        out, seen = [], set(have)
+        if field == "character":
+            return [dict(tag=c.name, count=c.count, kind="character", series=c.series)
+                    for c in self.characters[:limit]]
 
-        def add(tid, hint):
+        out, seen = [], set(self.ids(context.get(field)))
+
+        def add(tid, hint=""):
             if tid not in seen and len(out) < limit:
                 seen.add(tid)
-                out.append(dict(tag=self.tags[tid][0], count=self.tags[tid][2], kind="tag",
+                out.append(dict(tag=self.tags[tid].name, count=self.tags[tid].count, kind="tag",
                                 field=field, hint=hint))
 
-        if field == "character":
-            return [dict(tag=c[0], count=c[1], kind="character", series=c[2]) for c in self.characters[:limit]]
-
+        # 1. the character's own tags for this field
         ci = self.find_character(context.get("character"))
         if ci is not None:
             for tid, pct in self._char_field_tags(ci).get(field, ()):
                 add(tid, f"{pct}%")
+        # 2. what the pictures most similar to the other fields have here
         ctx = self._context_ids(context, skip=(field, "character"))
         if ctx and len(out) < limit:
             self._load_pool()
-            scores, mask = self._score_posts(ctx, field, rating)
-            if mask.any():
-                top = self._top_posts(scores, mask, 300)
+            scores, usable = self._score_posts(ctx, field, rating)
+            if usable.any():
+                top = self._top_posts(scores, usable, 300)
                 counts = np.bincount(np.concatenate([self._post_tags(p) for p in top]),
                                      minlength=len(self.tags))
-                fi = self.field_index[field]
-                counts[self.tag_field != fi] = 0
+                counts[self.tag_field != self.field_index[field]] = 0
                 for tid in np.argsort(-counts)[:limit * 2]:
                     if counts[tid] < 3:
                         break
-                    add(int(tid), "")
+                    add(int(tid))
+        # 3. the field's most popular tags
         for tid in self.by_field.get(field, ()):
             if len(out) >= limit:
                 break
-            add(tid, "")
+            add(tid)
         return out
 
     # ------------------------------------------------------ character preset
-    def _dedupe(self, picked):
-        """Drop tags that another picked tag already implies (shirt < white_shirt)."""
-        implied = set()
-        for t in picked:
-            implied |= self.implies.get(t, set())
-        return [t for t in picked if t not in implied]
-
     def _is_colour_variant(self, tag, parent):
         """white_shirt is a colour variant of shirt; sleeveless_shirt is not."""
-        name, pname = self.tags[tag][0], self.tags[parent][0]
+        name, pname = self.tags[tag].name, self.tags[parent].name
         return name.endswith("_" + pname) and name[:-len(pname)] in self.colors
 
-    def _select(self, field, items, strict=True):
+    def _select(self, field, items, min_percent=None):
         """Pick the tags of one field for a preset from [(tag id, percent)]."""
         min_pct, rel, max_tags = PRESET_RULES[field]
-        if not strict:
-            min_pct = min(min_pct, 8)
-        items = [(t, p) for t, p in items if t not in self.soft]
-        if not items:
-            return []
-        pct = dict(items)
-        cand = [t for t, p in items if p >= min_pct]
+        if min_percent is not None:
+            min_pct = min(min_pct, min_percent)
+        pct = {t: p for t, p in items if t not in self.soft}
+        cand = [t for t, p in pct.items() if p >= min_pct]
 
         # one tag per exclusive group (one hair colour, one hair length, ...)
         by_group = {}
@@ -327,7 +353,7 @@ class TagDB:
                 if best in self.implies.get(t, ()) and pct[t] >= 0.5 * pct[best]:
                     best = t
             keep = [best]
-            if self.groups[g]["multi"] & set(cand):
+            if self.groups[g]["multi"] & set(cand):     # e.g. two-tone hair: allow a second colour
                 keep += [t for t in members if t != best
                          and best not in self.implies.get(t, ()) and t not in self.implies.get(best, ())
                          and pct[t] >= 0.4 * pct[best]][:1]
@@ -337,15 +363,15 @@ class TagDB:
         # specific vs generic (white_shirt vs shirt): the specific tag wins when
         # it covers a fair share of the generic one, otherwise it is noise
         drop = set()
-        kids = {}
+        variants_of = {}
         for t in cand:
             for parent in self.implies.get(t, ()):
                 if parent in pct and pct[t] < 0.2 * pct[parent]:
                     drop.add(t)
                 elif self._is_colour_variant(t, parent):
-                    kids.setdefault(parent, []).append(t)
+                    variants_of.setdefault(parent, []).append(t)
         # colour variants of one garment: keep the main colour unless it is a close call
-        for parent, variants in kids.items():
+        for variants in variants_of.values():
             variants = sorted((t for t in variants if t not in drop), key=lambda t: -pct[t])
             drop |= {t for t in variants[1:] if pct[t] < 0.75 * pct[variants[0]]}
         cand = self._dedupe([t for t in cand if t not in drop])
@@ -358,73 +384,76 @@ class TagDB:
         return cand[:max_tags]
 
     def character_preset(self, name):
-        """The usual look of a character: {"character": [...], "hair": [...], ...}"""
+        """The usual look of a character, or None if the character is unknown.
+
+        ``{"character": name, "series": ..., "count": posts, "fields": {field id: [tags]}}``
+        """
         self.load()
         ci = self.char_id.get(normalize(name))
         if ci is None:
             return None
         c = self.characters[ci]
         per_field = self._char_field_tags(ci)
-        fields = {"character": [c[0]] + ([c[2]] if c[2] else [])}
+        fields = {"character": self._character_tags(c)}
         for field in self.field_ids:
             if field == "character":
                 continue
-            picked = self._select(field, per_field.get(field, []))
-            if not picked and field in ("hair", "eyes"):
-                picked = self._select(field, per_field.get(field, []), strict=False)
-            fields[field] = [self.tags[t][0] for t in picked]
-        if "solo" not in fields["subject"]:
-            fields["subject"].append("solo")
-        fields["subject"].sort(key=lambda t: t == "solo")   # 1girl, solo
-        return dict(character=c[0], series=c[2], count=c[1], fields=fields)
+            items = per_field.get(field, [])
+            picked = self._select(field, items)
+            if not picked and field in PRESET_FALLBACK_PERCENT:
+                picked = self._select(field, items, PRESET_FALLBACK_PERCENT[field])
+            if field == "subject":
+                solo = self.tag_id["solo"]      # the statistics are about solo pictures
+                picked = sorted(picked + [solo] * (solo not in picked), key=self._subject_order)
+            fields[field] = [self.tags[t].name for t in picked]
+        return dict(character=c.name, series=c.series, count=c.count, fields=fields)
 
-    # ---------------------------------------------------------------- random
+    # ------------------------------------------------------------------ dice
     def _post_tags(self, p):
         return self.p_tags[self.p_indptr[p]:self.p_indptr[p + 1]]
 
     def _score_posts(self, ctx_ids, field, rating, want=1):
-        """How well each pool post matches the context + which posts are usable."""
+        """(how well each pool picture matches the context, which pictures may be used)."""
         scores = np.zeros(self.p_n, dtype=np.float32)
         for t in ctx_ids:
             scores[self.inv_posts[self.inv_ptr[t]:self.inv_ptr[t + 1]]] += self.idf[t]
-        mask = self.p_rating <= rating_level(rating)
+        usable = self.p_rating <= rating_level(rating)
         if field is not None:
             have = self.p_field_count[self.field_index[field]]
-            # posts that can fill the field on their own keep the pick coherent
-            full = mask & (have >= want)
-            mask = full if full.sum() >= 200 else mask & (have > 0)
-        return scores, mask
+            # pictures that can fill the field on their own keep the pick coherent
+            full = usable & (have >= want)
+            usable = full if full.sum() >= 200 else usable & (have > 0)
+        return scores, usable
 
-    def _top_posts(self, scores, mask, k):
-        idx = np.flatnonzero(mask)
+    def _top_posts(self, scores, usable, k):
+        idx = np.flatnonzero(usable)
         if len(idx) <= k:
             return idx
-        part = np.argpartition(-scores[idx], k)[:k]
-        return idx[part]
+        return idx[np.argpartition(-scores[idx], k)[:k]]
 
     def _draw_posts(self, ctx_ids, field, rating, rng, want=1, k=30):
-        """Pool posts in the order they should be tried: good matches first."""
-        scores, mask = self._score_posts(ctx_ids, field, rating, want)
-        if not mask.any():
+        """Pool pictures in the order they should be tried: good matches first."""
+        scores, usable = self._score_posts(ctx_ids, field, rating, want)
+        if not usable.any():
             return []
         if ctx_ids:
-            # the better a post matches, the likelier it is drawn - but the
+            # the better a picture matches, the likelier it is drawn - but the
             # candidates stay numerous enough to keep results varied
-            top = self._top_posts(scores, mask, 80)
+            top = self._top_posts(scores, usable, 80)
             w = scores[top].astype(np.float64)
             w = np.exp((w - w.max()) / max(1e-6, 0.12 * max(float(w.max()), 1.0)))
             order = rng.choices([int(p) for p in top], weights=list(w), k=k)
         else:
-            idx = np.flatnonzero(mask)
+            idx = np.flatnonzero(usable)
             order = [int(idx[rng.randrange(len(idx))]) for _ in range(k)]
         return list(dict.fromkeys(order))
 
     def _usable(self, tid, rating):
-        t = self.tags[tid]
-        if t[2] < RANDOM_MIN_COUNT:          # too rare for image models to know
+        tag = self.tags[tid]
+        if tag.count < RANDOM_MIN_COUNT:
             return False
         # below "questionable", skip tags that mostly appear on questionable/explicit pictures
-        return rating_level(rating) >= 2 or t[3] < 0.5
+        return rating_level(rating) >= 2 or tag.nsfw < 0.5
 
     def _conflicts(self, tid, picked):
         """Would adding ``tid`` contradict or merely repeat what is picked?"""
@@ -440,13 +469,13 @@ class TagDB:
         return False
 
     def _take(self, post, field, count, rating, rng, picked=()):
-        """Up to ``count`` tags of one field from one pool post."""
+        """``picked`` plus tags of one field from one pool picture, up to ``count`` in total."""
         fi = self.field_index[field]
         tags = [int(t) for t in self._post_tags(post) if self.tag_field[t] == fi and self._usable(int(t), rating)]
         tags = self._dedupe(tags)
         rng.shuffle(tags)
-        if field == "subject":   # "1girl, solo" before anything more specific
-            tags.sort(key=lambda t: (self.group_of.get(t) != "subject", self.tags[t][0] != "solo"))
+        if field == "subject":
+            tags.sort(key=self._subject_order)
         out = list(picked)
         for t in tags:
             if len(out) >= count:
@@ -456,15 +485,20 @@ class TagDB:
         return out
 
     def _names(self, ids, field):
-        if field == "subject":
-            ids = sorted(ids, key=lambda t: (self.group_of.get(t) != "subject", self.tags[t][0] == "solo"))
-        else:
-            ids = sorted(ids, key=lambda t: -self.tags[t][2])
-        return [self.tags[t][0] for t in ids]
+        """Tag names in the order they are shown: most common first."""
+        key = self._subject_order if field == "subject" else (lambda t: -self.tags[t].count)
+        return [self.tags[t].name for t in sorted(ids, key=key)]
 
-    def random_field(self, field, count, context, rating=DEFAULT_RATING, rng=None):
-        """``count`` tags for one field that fit the rest of the prompt."""
-        rng = rng or random
+    def random_character(self, rng=random):
+        self.load()
+        if self._char_weights is None:
+            # well-known characters with clean statistics, weighted by popularity
+            self._char_weights = [math.sqrt(c.count) if c.count >= 300 and c.clean and self._is_person(i) else 0.0
+                                  for i, c in enumerate(self.characters)]
+        return self._character_tags(rng.choices(self.characters, weights=self._char_weights, k=1)[0])
+
+    def random_field(self, field, count, context, rating=DEFAULT_RATING, rng=random):
+        """Up to ``count`` tags for one field that fit the rest of the prompt."""
         count = max(0, int(count))
         if count == 0:
             return []
@@ -479,69 +513,52 @@ class TagDB:
                 break
         return self._names(picked, field)
 
-    def random_character(self, rng=None):
-        rng = rng or random
-        self.load()
-        if not hasattr(self, "_char_weights"):
-            # well-known characters with clean statistics, weighted by popularity
-            self._char_weights = [math.sqrt(c[1]) if c[1] >= 300 and c[4] and self._is_person(i) else 0.0
-                                  for i, c in enumerate(self.characters)]
-        c = rng.choices(self.characters, weights=self._char_weights, k=1)[0]
-        return [c[0]] + ([c[2]] if c[2] else [])
-
     def randomize(self, fields, counts, context, rating=DEFAULT_RATING, seed=None):
-        """Fill several fields at once.  ``context`` holds the fields to keep.
+        """Roll the given fields; ``context`` holds the current tags of all fields.
 
-        All fields are taken from one real picture where possible, so that the
-        outfit, pose and scene belong together; gaps are filled from other
-        pictures that match what has been chosen so far.
+        One field is rolled on its own.  Several fields are taken from one real
+        picture where possible, so that outfit, pose and scene belong together;
+        gaps are filled from other pictures that match what has been chosen so
+        far.  With a character set, their identity fields are not rolled but
+        taken from the character.
         """
         self.load()
         rng = random.Random(seed) if seed is not None else random
-        context = {k: list(v) for k, v in (context or {}).items()}
+        todo = [f for f in self.field_ids if f in fields]
+        context = {f: list(tags) for f, tags in (context or {}).items() if f not in todo}
         counts = counts or {}
         out = {}
-        todo = [f for f in self.field_ids if f in fields]
-        for f in todo:
-            context.pop(f, None)
-        if not todo:
-            return out
 
         def put(field, tags):
-            out[field] = tags
-            context[field] = tags
+            out[field] = context[field] = tags
 
         def count_of(field):
-            default = next(x["count"] for x in self.fields if x["id"] == field)
-            return max(0, int(counts.get(field, default)))
+            return max(0, int(counts.get(field, self.default_count[field])))
+
+        if len(todo) == 1:
+            put(todo[0], self.random_field(todo[0], count_of(todo[0]), context, rating, rng))
+            return out
 
         if "character" in todo:
             put("character", self.random_character(rng) if count_of("character") > 0 else [])
-        rest = [f for f in todo if f != "character"]
-        if len(todo) == 1:
-            for f in rest:
-                put(f, self.random_field(f, count_of(f), context, rating, rng))
-            return out
-
+            todo.remove("character")
         ci = self.find_character(context.get("character"))
         if ci is not None:
-            preset = self.character_preset(self.characters[ci][0])["fields"]
-            for f in [f for f in rest if f in IDENTITY_FIELDS]:
+            preset = self.character_preset(self.characters[ci].name)["fields"]
+            for f in [f for f in todo if f in IDENTITY_FIELDS]:
                 put(f, preset[f])
-                rest.remove(f)
-        if not rest:
+                todo.remove(f)
+        if not todo:
             return out
 
         self._load_pool()
-        anchor = None
         posts = self._draw_posts(self._context_ids(context, skip=("character",)), None, rating, rng, k=1)
-        if posts:
-            anchor = posts[0]
+        anchor = posts[0] if posts else None
         # a picture that is already dressed (a dress, or a shirt and a skirt)
         # should not get more clothes from elsewhere
         dressed = anchor is not None and sum(
             int(self.p_field_count[self.field_index[g]][anchor]) for g in GARMENT_FIELDS) >= 2
-        for f in rest:
+        for f in todo:
             n = count_of(f)
             picked = self._take(anchor, f, n, rating, rng) if anchor is not None and n else []
             if picked or n == 0 or (dressed and f in GARMENT_FIELDS):

@@ -32,7 +32,6 @@ import json
 import os
 import pickle
 import random
-import re
 import sys
 import time
 import urllib.request
@@ -42,8 +41,8 @@ sys.path.insert(0, HERE)
 
 from field_rules import (  # noqa: E402
     ALT_LOOK_TAGS,
-    EXCLUSIVE_GROUPS,
     COLORS,
+    EXCLUSIVE_GROUPS,
     FIELDS,
     NOT_IDENTITY,
     POOL_EXCLUDE_TAGS,
@@ -96,6 +95,33 @@ def stage_download(work):
                     break
                 f.write(chunk)
         os.replace(tmp, dest)
+
+
+# --------------------------------------------------------------- implications
+def load_implications(work):
+    import pyarrow.parquet as pq
+    imp = pq.read_table(os.path.join(work, "tag_implications.parquet")).to_pydict()
+    implies = collections.defaultdict(set)
+    for a, b, st in zip(imp["antecedent_name"], imp["consequent_name"], imp["status"]):
+        if st == "active":
+            implies[a].add(b)
+    return implies
+
+
+def transitive(implies):
+    """tag -> every tag it implies, directly or indirectly."""
+    out = {}
+
+    def walk(t, seen):
+        for u in implies.get(t, ()):
+            if u not in seen:
+                seen.add(u)
+                walk(u, seen)
+        return seen
+
+    for t in list(implies):
+        out[t] = walk(t, set())
+    return out
 
 
 # ----------------------------------------------------------------------- scan
@@ -257,16 +283,6 @@ def stage_scan(work, jobs):
 
 
 # ---------------------------------------------------------------------- build
-def load_implications(work):
-    import pyarrow.parquet as pq
-    imp = pq.read_table(os.path.join(work, "tag_implications.parquet")).to_pydict()
-    implies = collections.defaultdict(set)
-    for a, b, st in zip(imp["antecedent_name"], imp["consequent_name"], imp["status"]):
-        if st == "active":
-            implies[a].add(b)
-    return implies
-
-
 def load_side_tables(work):
     import pyarrow.parquet as pq
     tax = pq.read_table(os.path.join(work, "taxonomy.parquet")).to_pydict()
@@ -300,22 +316,6 @@ def load_side_tables(work):
     return slots, aliases, groups, implies, jio7
 
 
-def transitive(implies):
-    """tag -> every tag it implies, directly or indirectly."""
-    out = {}
-
-    def walk(t, seen):
-        for u in implies.get(t, ()):
-            if u not in seen:
-                seen.add(u)
-                walk(u, seen)
-        return seen
-
-    for t in list(implies):
-        out[t] = walk(t, set())
-    return out
-
-
 def stage_build(work, out_dir):
     import numpy as np
 
@@ -326,10 +326,12 @@ def stage_build(work, out_dir):
     implied = transitive(implies)
 
     gen_names, gen_count, gen_nsfw = scan["gen_names"], scan["gen_count"], scan["gen_nsfw"]
-    field_ids = {name: i for i, (name, _label, _n) in enumerate(FIELDS)}
+    field_index = {field[0]: i for i, field in enumerate(FIELDS)}
 
     # ---- general tags -> fields ------------------------------------------
-    # new id = position in `tags`; old (scan) ids are remapped through `remap`.
+    # A tag's id is its position in `tags`; the ids used by the scan are
+    # translated through `remap`.  Each entry: [name, field, posts, share of
+    # those posts rated questionable or explicit].
     tags, remap, report = [], {}, collections.defaultdict(list)
     for old, (name, count, nsfw) in enumerate(zip(gen_names, gen_count, gen_nsfw)):
         field = classify_tag(name, slots.get(name), groups.get(name, ()), jio7.get(name))
@@ -337,7 +339,7 @@ def stage_build(work, out_dir):
         if field is None:
             continue
         remap[old] = len(tags)
-        tags.append([name, field_ids[field], count, round(nsfw / count, 2)])
+        tags.append([name, field_index[field], count, round(nsfw / count, 2)])
     tag_id = {t[0]: i for i, t in enumerate(tags)}
     log(f"{len(tags)} of {len(gen_names)} general tags assigned to fields")
     with open(os.path.join(work, "field_report.txt"), "w", encoding="utf8") as f:
@@ -402,7 +404,7 @@ def stage_build(work, out_dir):
             if freq >= CHAR_MIN_FREQ:
                 per_field[tags[new][1]].append((freq, new))
         flat = []
-        for fid, items in per_field.items():
+        for items in per_field.values():
             items.sort(reverse=True)
             flat.extend([new, round(freq * 100)] for freq, new in items[:CHAR_TAGS_PER_FIELD])
         flat.sort(key=lambda x: -x[1])
@@ -438,9 +440,8 @@ def stage_build(work, out_dir):
     # ---- write ------------------------------------------------------------
     os.makedirs(out_dir, exist_ok=True)
     meta = dict(
-        version=1,
         built=time.strftime("%Y-%m-%d"),
-        fields=[dict(id=n, label=l, count=c) for n, l, c in FIELDS],
+        fields=[dict(id=i, label=label, count=count, group=group) for i, label, count, group in FIELDS],
         tags=tags,
         implies=imp_out,
         groups=groups_out,

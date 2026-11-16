@@ -1,15 +1,18 @@
 """Run with:  python -m pytest tests"""
 
+import json
 import os
 import random
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 from nodes import format_tag, join_fields, parse_fields  # noqa: E402
-from tagdb import DB, normalize, rating_level  # noqa: E402
+from tagdb import DB, RATINGS, normalize, rating_level  # noqa: E402
 
 DB.load()
+ALL_BUT_CHARACTER = [f for f in DB.field_ids if f != "character"]
 
 
 def test_format_tag():
@@ -23,11 +26,13 @@ def test_format_tag():
 
 
 def test_join_fields():
-    value = '{"fields": {"hair": ["aqua_hair", "twintails"], "character": ["hatsune_miku"], "subject": ["1girl"]}}'
+    value = json.dumps({"fields": {"character": ["hatsune_miku"], "subject": ["1girl"],
+                                   "hair": ["aqua_hair", " twintails ", ""], "eyes": ["Aqua Hair"]}})
+    # subject leads, then the fields in the order given; blanks and repeats are dropped
     assert join_fields(parse_fields(value)) == "1girl, hatsune miku, aqua hair, twintails"
+    assert join_fields(parse_fields(value), spaces=False) == "1girl, hatsune_miku, aqua_hair, twintails"
     assert join_fields(parse_fields("")) == ""
-    assert join_fields(parse_fields({"hair": "a, b", "eyes": ["a"]}), spaces=False) == "a, b"
-    assert join_fields(parse_fields("plain, text")) == "plain, text"
+    assert join_fields(parse_fields({"fields": {"hair": ["a"]}})) == "a"
 
 
 def test_normalize():
@@ -38,14 +43,18 @@ def test_normalize():
 
 def test_autocomplete():
     assert DB.autocomplete("character", "hatsune")[0]["tag"] == "hatsune_miku"
+    assert DB.autocomplete("character", "miku")[0]["tag"] == "hatsune_miku"      # a later word matches too
     assert DB.autocomplete("character", "Hatsune Miku")[0]["series"] == "vocaloid"
+    assert DB.autocomplete("legwear", "stockings")[0] == dict(
+        DB.autocomplete("legwear", "thighhighs")[0], alias="stockings")          # found through an alias
     top = DB.autocomplete("top", "leather")
-    assert top[0]["tag"] == "leather_jacket" and top[0]["field"] == "top"
+    assert top[0]["tag"] == "leather_jacket" and top[0]["field"] == "top"        # own field first
     assert DB.autocomplete("hair", "") == []
 
 
 def test_character_preset():
     fields = DB.character_preset("hatsune_miku")["fields"]
+    assert list(fields) == DB.field_ids
     assert fields["character"] == ["hatsune_miku", "vocaloid"]
     assert fields["subject"] == ["1girl", "solo"]
     assert {"twintails", "aqua_hair", "very_long_hair"} <= set(fields["hair"])
@@ -55,34 +64,50 @@ def test_character_preset():
     assert DB.character_preset("no_such_character_tag") is None
 
 
-def test_random():
-    ctx = {"character": ["hatsune_miku", "vocaloid"]}
-    a = DB.randomize([f for f in DB.field_ids if f != "character"], {}, ctx, "sensitive", seed=7)
-    b = DB.randomize([f for f in DB.field_ids if f != "character"], {}, ctx, "sensitive", seed=7)
-    assert a == b                                           # same seed, same result
+def test_randomize():
+    miku = {"character": ["hatsune_miku", "vocaloid"]}
+    a = DB.randomize(ALL_BUT_CHARACTER, {}, miku, seed=7)
+    assert a == DB.randomize(ALL_BUT_CHARACTER, {}, miku, seed=7)     # same seed, same result
     assert "aqua_hair" in a["hair"]                         # identity comes from the character
-    assert "character" not in a
+    assert "character" not in a                             # only the requested fields come back
 
-    hair = DB.random_field("hair", 3, {}, "sensitive", random.Random(1))
+    original = DB.randomize(DB.field_ids, {"character": 0}, {}, seed=3)
+    assert original["character"] == [] and original["subject"][0] in ("1girl", "1boy", "1other")
+
+    # one field on its own: the character dice does not touch anything else
+    assert list(DB.randomize(["character"], {}, {"hair": ["red_hair"]}, seed=1)) == ["character"]
+
+
+def test_random_field():
+    hair = DB.random_field("hair", 3, {}, rng=random.Random(1))
     assert 1 <= len(hair) <= 3
-    colours = set(DB.groups["hair_color"]["tags"])
-    multi = DB.groups["hair_color"]["multi"]
     ids = DB.ids(hair)
-    assert sum(i in colours for i in ids) <= 1 or any(i in multi for i in ids)
+    colours = set(DB.groups["hair_color"]["tags"])
+    assert sum(i in colours for i in ids) <= 1 or DB.groups["hair_color"]["multi"] & set(ids)
+    assert DB.random_field("hair", 0, {}) == []
 
-    full = DB.randomize(DB.field_ids, {"character": 0}, {}, "sensitive", seed=3)
-    assert full["character"] == [] and full["subject"]
+
+def test_ratings_are_cumulative():
+    assert [rating_level(r) for r in RATINGS] == [0, 1, 2, 3]
+    assert rating_level(None) == rating_level("nonsense") == 1          # unknown -> the default
+    DB._load_pool()
+    sizes = [int(DB._score_posts([], None, r)[1].sum()) for r in RATINGS]
+    assert sizes == sorted(sizes) and len(set(sizes)) == 4          # each rating adds pictures
+    assert sizes[-1] == DB.p_n                                       # explicit = everything
 
 
 def test_suggest():
     tags = [s["tag"] for s in DB.suggest("pose", {"outfit": ["swimsuit"], "background": ["beach"]})]
     assert tags and len(tags) == len(set(tags))
+    top = DB.suggest("top", DB.character_preset("hatsune_miku")["fields"])
+    assert top[0]["hint"].endswith("%")                      # the character's own tags come first
 
 
-def test_ratings_are_cumulative():
-    assert [rating_level(r) for r in ("general", "sensitive", "questionable", "explicit")] == [0, 1, 2, 3]
-    assert rating_level("sfw") == 1 and rating_level("nsfw") == 3     # values saved by older versions
-    assert rating_level(None) == rating_level("nonsense") == 1
-    sizes = [int(DB._score_posts([], None, r)[1].sum()) for r in ("general", "sensitive", "questionable", "explicit")]
-    assert sizes == sorted(sizes) and len(set(sizes)) == 4          # each rating adds pictures
-    assert sizes[-1] == DB.p_n                                       # explicit = everything
+def test_example_workflow_matches_the_widget_format():
+    with open(os.path.join(ROOT, "example_workflows", "character_helper.json"), encoding="utf8") as f:
+        workflow = json.load(f)
+    node = next(n for n in workflow["nodes"] if n["type"] == "CharacterHelper")
+    state = json.loads(node["widgets_values"][0])
+    assert list(state["fields"]) == DB.field_ids and state["counts"] == DB.default_count
+    assert state["rating"] in RATINGS
+    assert join_fields(parse_fields(node["widgets_values"][0])).startswith("1girl, solo, hijiri byakuren, touhou")
