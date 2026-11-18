@@ -35,7 +35,8 @@ The output is one comma separated string:
 
 ## Install
 
-Clone into `ComfyUI/custom_nodes` and restart ComfyUI:
+Search for **Character Helper** in ComfyUI Manager, or clone into `ComfyUI/custom_nodes`
+and restart ComfyUI:
 
 ```bash
 git clone https://github.com/Adamovix/ComfyUI-Character-Helper
