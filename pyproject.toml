@@ -1,6 +1,6 @@
 [project]
 name = "character-helper"
-description = "Builds a coherent Danbooru-style tag prompt for a character. Pick a character and the node can fill in their usual look – hair, eyes, outfit, accessories – as editable tags. Swap what you want, or roll the dice."
+description = "Builds a coherent Danbooru-style tag prompt for a character. Pick a character and the node can fill in their usual look – hair, eyes, outfit, accessories – as editable tags. Swap what you want, or roll the dice to randomize."
 version = "1.0.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
