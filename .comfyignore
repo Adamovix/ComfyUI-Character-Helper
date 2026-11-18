@@ -1,0 +1,8 @@
+# Left out of the package users install from the registry / ComfyUI Manager.
+# Everything here stays in the git repository.
+.github/
+docs/
+tests/
+tools/
+.gitignore
+.comfyignore

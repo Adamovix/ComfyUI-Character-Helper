@@ -1,0 +1,26 @@
+# Publishes the version in pyproject.toml to the Comfy Registry (and so to
+# ComfyUI Manager) whenever that file changes on main.  To release: raise
+# `version` in pyproject.toml and merge to main.
+name: Publish to Comfy registry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+
+jobs:
+  publish-node:
+    name: Publish Custom Node to registry
+    runs-on: ubuntu-latest
+    # forks of the repository have no token and must not try to publish
+    if: ${{ github.repository_owner == 'Adamovix' }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Publish Custom Node
+        uses: Comfy-Org/publish-node-action@main
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
